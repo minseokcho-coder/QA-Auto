@@ -45,12 +45,20 @@ jobs:
       - name: 의존성 설치
         run: |
           pip install -r requirements-qa.txt
-          playwright install chromium
-          playwright install-deps chromium
+
+      - name: Chrome 브라우저 설치
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: 테스트 환경 준비
+        run: |
+          mkdir -p qa/reports
 
       - name: 전체 E2E 테스트 실행
         env:
           QA_HEADLESS: 'true'
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           cd qa
           python -m pytest tests/ \

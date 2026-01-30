@@ -151,10 +151,14 @@ jobs:
         run: |
           pip install -r requirements-qa.txt
 
-      - name: Playwright 설치
+      - name: Chrome 브라우저 설치
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: 테스트 환경 준비
         run: |
-          playwright install chromium
-          playwright install-deps chromium
+          mkdir -p qa/reports
 
       - name: 테스트 환경 URL 설정
         id: env-url
@@ -177,6 +181,7 @@ jobs:
         env:
           QA_BASE_URL: ${{ steps.env-url.outputs.url }}
           QA_HEADLESS: 'true'
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           cd qa
           python -m pytest tests/ \
