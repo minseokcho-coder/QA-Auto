@@ -1,0 +1,30 @@
+# SAVETAX QA 자동화 의존성
+
+# Selenium 및 WebDriver
+selenium>=4.15.0
+webdriver-manager>=4.0.1
+
+# Playwright (E2E 테스트)
+playwright>=1.40.0
+
+# pytest 및 플러그인
+pytest>=7.4.0
+pytest-html>=4.1.0
+pytest-xdist>=3.5.0
+pytest-timeout>=2.2.0
+pytest-json-report>=1.5.0
+pytest-playwright>=0.4.0
+
+# 엑셀 리포트
+openpyxl>=3.1.0
+pandas>=2.0.0
+
+# 이미지 처리 (시각적 회귀 테스트)
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# HTTP 요청
+requests>=2.31.0
+
+# 유틸리티
+python-dotenv>=1.0.0

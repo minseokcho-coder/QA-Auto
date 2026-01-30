@@ -1,0 +1,193 @@
+name: QA 정기 테스트 (오전 10시)
+
+on:
+  # ========================================
+  # 🕙 오전 10시 정각 리포팅을 위한 스케줄
+  # ========================================
+  # 테스트 실행 시간: 약 5-10분
+  # 9:50 KST 시작 → 10:00 KST 리포팅 도착
+  # 9:50 KST = 0:50 UTC
+  schedule:
+    - cron: '50 0 * * 1-5'  # 평일 오전 9:50 KST
+
+  # 수동 실행
+  workflow_dispatch:
+    inputs:
+      send_slack:
+        description: 'Slack 알림 전송'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  QA_BASE_URL: https://qa.hiddenmoney.co.kr
+  SLACK_CHANNEL_ID: C0ACQMG41CY
+
+jobs:
+  daily-test:
+    name: 📅 일일 QA 테스트
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 시작 시간 기록
+        run: |
+          echo "🕐 테스트 시작: $(TZ='Asia/Seoul' date '+%Y-%m-%d %H:%M:%S') KST"
+
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 의존성 설치
+        run: |
+          pip install -r requirements-qa.txt
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: 전체 E2E 테스트 실행
+        env:
+          QA_HEADLESS: 'true'
+        run: |
+          cd qa
+          python -m pytest tests/ \
+            -v \
+            --tb=short \
+            --html=reports/daily-report.html \
+            --self-contained-html \
+            --json-report \
+            --json-report-file=reports/daily-report.json \
+            || true
+
+      - name: 테스트 결과 업로드
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: daily-test-${{ github.run_number }}
+          path: qa/reports/
+          retention-days: 14
+
+      # ========================================
+      # Slack 리포트 (Bot Token 방식)
+      # ========================================
+      - name: Slack 일일 리포트 (Bot Token)
+        if: always() && secrets.SLACK_BOT_TOKEN != ''
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        run: |
+          TOTAL=0
+          PASSED=0
+          FAILED=0
+          SKIPPED=0
+
+          if [ -f "qa/reports/daily-report.json" ]; then
+            TOTAL=$(python -c "import json; print(json.load(open('qa/reports/daily-report.json')).get('summary',{}).get('total',0))")
+            PASSED=$(python -c "import json; print(json.load(open('qa/reports/daily-report.json')).get('summary',{}).get('passed',0))")
+            FAILED=$(python -c "import json; print(json.load(open('qa/reports/daily-report.json')).get('summary',{}).get('failed',0))")
+            SKIPPED=$(python -c "import json; print(json.load(open('qa/reports/daily-report.json')).get('summary',{}).get('skipped',0))")
+          fi
+
+          if [ "$TOTAL" -gt 0 ]; then
+            PASS_RATE=$(echo "scale=1; $PASSED * 100 / $TOTAL" | bc)
+          else
+            PASS_RATE="0.0"
+          fi
+
+          # 상태 결정
+          if [ $(echo "$PASS_RATE >= 95" | bc -l) -eq 1 ]; then
+            COLOR="#36a64f"
+            EMOJI="✅"
+            STATUS="PASSED"
+          elif [ $(echo "$PASS_RATE >= 80" | bc -l) -eq 1 ]; then
+            COLOR="#ffcc00"
+            EMOJI="⚠️"
+            STATUS="WARNING"
+          else
+            COLOR="#ff0000"
+            EMOJI="❌"
+            STATUS="FAILED"
+          fi
+
+          TODAY=$(TZ='Asia/Seoul' date '+%Y-%m-%d')
+          NOW=$(TZ='Asia/Seoul' date '+%H:%M')
+
+          # Slack API로 메시지 전송
+          curl -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "{
+              \"channel\": \"${{ env.SLACK_CHANNEL_ID }}\",
+              \"text\": \"$EMOJI 일일 QA 리포트 - $TODAY\",
+              \"attachments\": [{
+                \"color\": \"$COLOR\",
+                \"blocks\": [
+                  {
+                    \"type\": \"header\",
+                    \"text\": {
+                      \"type\": \"plain_text\",
+                      \"text\": \"$EMOJI 세이브택스 일일 QA 리포트\",
+                      \"emoji\": true
+                    }
+                  },
+                  {
+                    \"type\": \"section\",
+                    \"fields\": [
+                      {\"type\": \"mrkdwn\", \"text\": \"*날짜:*\n$TODAY\"},
+                      {\"type\": \"mrkdwn\", \"text\": \"*시간:*\n$NOW KST\"},
+                      {\"type\": \"mrkdwn\", \"text\": \"*상태:*\n$STATUS\"},
+                      {\"type\": \"mrkdwn\", \"text\": \"*통과율:*\n${PASS_RATE}%\"}
+                    ]
+                  },
+                  {
+                    \"type\": \"divider\"
+                  },
+                  {
+                    \"type\": \"section\",
+                    \"text\": {
+                      \"type\": \"mrkdwn\",
+                      \"text\": \"*📊 테스트 결과*\n• 전체: ${TOTAL}개\n• 통과: ${PASSED}개 ✓\n• 실패: ${FAILED}개 ✗\n• 스킵: ${SKIPPED}개\"
+                    }
+                  },
+                  {
+                    \"type\": \"context\",
+                    \"elements\": [
+                      {\"type\": \"mrkdwn\", \"text\": \"<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|🔗 GitHub Actions에서 상세 보기>\"}
+                    ]
+                  }
+                ]
+              }]
+            }"
+
+      # ========================================
+      # Slack 리포트 (Webhook 방식 - 대체)
+      # ========================================
+      - name: Slack 일일 리포트 (Webhook)
+        if: always() && secrets.SLACK_BOT_TOKEN == '' && secrets.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          TOTAL=0
+          PASSED=0
+          FAILED=0
+
+          if [ -f "qa/reports/daily-report.json" ]; then
+            TOTAL=$(python -c "import json; print(json.load(open('qa/reports/daily-report.json')).get('summary',{}).get('total',0))")
+            PASSED=$(python -c "import json; print(json.load(open('qa/reports/daily-report.json')).get('summary',{}).get('passed',0))")
+            FAILED=$(python -c "import json; print(json.load(open('qa/reports/daily-report.json')).get('summary',{}).get('failed',0))")
+          fi
+
+          TODAY=$(TZ='Asia/Seoul' date '+%Y-%m-%d')
+
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{
+              \"text\": \"📅 *세이브택스 일일 QA 리포트* - $TODAY\n• 전체: ${TOTAL}개\n• 통과: ${PASSED}개 ✓\n• 실패: ${FAILED}개 ✗\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|상세 보기>\"
+            }" \
+            $SLACK_WEBHOOK_URL
+
+      - name: 완료 시간 기록
+        if: always()
+        run: |
+          echo "🕐 테스트 완료: $(TZ='Asia/Seoul' date '+%Y-%m-%d %H:%M:%S') KST"

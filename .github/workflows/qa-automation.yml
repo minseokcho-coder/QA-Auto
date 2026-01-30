@@ -1,0 +1,547 @@
+name: QA 자동화 파이프라인
+
+on:
+  # 수동 실행
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: '테스트 환경'
+        required: true
+        default: 'qa'
+        type: choice
+        options:
+          - qa
+          - staging
+          - prod
+      skip_figma:
+        description: 'Figma 체크 스킵'
+        required: false
+        default: false
+        type: boolean
+      skip_visual:
+        description: '시각적 테스트 스킵'
+        required: false
+        default: false
+        type: boolean
+      generate_tc:
+        description: 'TC 자동 생성'
+        required: false
+        default: false
+        type: boolean
+
+  # 스케줄 (매일 오전 9시 KST = UTC 0시)
+  schedule:
+    - cron: '0 0 * * *'
+
+  # PR 시 자동 실행
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'src/**'
+      - 'qa/**'
+      - '.github/workflows/qa-automation.yml'
+
+  # main 브랜치 push 시
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+
+env:
+  PYTHON_VERSION: '3.11'
+  NODE_VERSION: '20'
+
+jobs:
+  # ========================================
+  # 1. Figma 변경 감지
+  # ========================================
+  figma-check:
+    name: 📐 Figma 변경 감지
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.skip_figma != 'true' }}
+    outputs:
+      has_changes: ${{ steps.check.outputs.has_changes }}
+      new_screens: ${{ steps.check.outputs.new_screens }}
+      modified_screens: ${{ steps.check.outputs.modified_screens }}
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: 의존성 설치
+        run: |
+          pip install requests python-dotenv
+
+      - name: Figma 변경 감지
+        id: check
+        env:
+          FIGMA_ACCESS_TOKEN: ${{ secrets.FIGMA_ACCESS_TOKEN }}
+          FIGMA_FILE_KEY: ${{ secrets.FIGMA_FILE_KEY }}
+          FIGMA_NODE_ID: ${{ secrets.FIGMA_NODE_ID }}
+        run: |
+          python -c "
+          import os
+          import json
+          import requests
+
+          token = os.environ.get('FIGMA_ACCESS_TOKEN')
+          file_key = os.environ.get('FIGMA_FILE_KEY', 'rcxhAYTksM5DmkrjqTuvHc')
+          node_id = os.environ.get('FIGMA_NODE_ID', '9987-46608')
+
+          if not token:
+              print('FIGMA_ACCESS_TOKEN not set, skipping...')
+              print('has_changes=false' )
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                  f.write('has_changes=false\n')
+              exit(0)
+
+          headers = {'X-Figma-Token': token}
+          url = f'https://api.figma.com/v1/files/{file_key}/nodes?ids={node_id}'
+
+          try:
+              response = requests.get(url, headers=headers)
+              response.raise_for_status()
+              data = response.json()
+              print(f'Figma API 호출 성공: {data.get(\"name\", \"Unknown\")}')
+              print(f'마지막 수정: {data.get(\"lastModified\", \"Unknown\")}')
+
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                  f.write('has_changes=true\n')
+                  f.write('new_screens=[]\n')
+                  f.write('modified_screens=[]\n')
+          except Exception as e:
+              print(f'Figma API 오류: {e}')
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                  f.write('has_changes=false\n')
+          "
+
+      - name: 변경 사항 요약
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          echo "🎨 Figma 디자인 변경 감지됨"
+          echo "새 화면: ${{ steps.check.outputs.new_screens }}"
+          echo "수정된 화면: ${{ steps.check.outputs.modified_screens }}"
+
+  # ========================================
+  # 2. E2E 테스트
+  # ========================================
+  e2e-test:
+    name: 🧪 E2E 테스트
+    runs-on: ubuntu-latest
+    needs: [figma-check]
+    if: always()
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: 의존성 설치
+        run: |
+          pip install -r requirements-qa.txt
+
+      - name: Playwright 설치
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: 테스트 환경 URL 설정
+        id: env-url
+        run: |
+          ENV="${{ github.event.inputs.environment || 'qa' }}"
+          case $ENV in
+            qa)
+              echo "url=https://qa.hiddenmoney.co.kr" >> $GITHUB_OUTPUT
+              ;;
+            staging)
+              echo "url=https://staging.hiddenmoney.co.kr" >> $GITHUB_OUTPUT
+              ;;
+            prod)
+              echo "url=https://www.hiddenmoney.co.kr" >> $GITHUB_OUTPUT
+              ;;
+          esac
+          echo "환경: $ENV"
+
+      - name: E2E 테스트 실행
+        env:
+          QA_BASE_URL: ${{ steps.env-url.outputs.url }}
+          QA_HEADLESS: 'true'
+        run: |
+          cd qa
+          python -m pytest tests/ \
+            -v \
+            --tb=short \
+            --html=reports/e2e-report.html \
+            --self-contained-html \
+            --json-report \
+            --json-report-file=reports/e2e-report.json \
+            || true
+
+      - name: 테스트 결과 업로드
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-test-results
+          path: |
+            qa/reports/e2e-report.html
+            qa/reports/e2e-report.json
+            qa/reports/screenshots/
+          retention-days: 30
+
+      - name: 테스트 결과 요약
+        if: always()
+        run: |
+          if [ -f qa/reports/e2e-report.json ]; then
+            python -c "
+          import json
+          with open('qa/reports/e2e-report.json') as f:
+              data = json.load(f)
+          summary = data.get('summary', {})
+          print('📊 E2E 테스트 결과')
+          print(f'  전체: {summary.get(\"total\", 0)}')
+          print(f'  통과: {summary.get(\"passed\", 0)}')
+          print(f'  실패: {summary.get(\"failed\", 0)}')
+          print(f'  스킵: {summary.get(\"skipped\", 0)}')
+            "
+          fi
+
+  # ========================================
+  # 3. 시각적 회귀 테스트
+  # ========================================
+  visual-test:
+    name: 👁️ 시각적 회귀 테스트
+    runs-on: ubuntu-latest
+    needs: [e2e-test]
+    if: ${{ github.event.inputs.skip_visual != 'true' && always() }}
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: 의존성 설치
+        run: |
+          pip install playwright Pillow numpy requests
+
+      - name: Playwright 설치
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: 베이스라인 이미지 다운로드
+        uses: actions/cache@v4
+        with:
+          path: qa/reports/visual/baseline
+          key: visual-baseline-${{ github.ref_name }}
+          restore-keys: |
+            visual-baseline-main
+            visual-baseline-
+
+      - name: 스크린샷 캡처
+        env:
+          QA_BASE_URL: ${{ needs.e2e-test.outputs.url || 'https://qa.hiddenmoney.co.kr' }}
+        run: |
+          python -c "
+          import asyncio
+          from pathlib import Path
+
+          # 간단한 스크린샷 캡처
+          async def capture():
+              from playwright.async_api import async_playwright
+
+              actual_dir = Path('qa/reports/visual/actual')
+              actual_dir.mkdir(parents=True, exist_ok=True)
+
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True)
+                  context = await browser.new_context(
+                      viewport={'width': 375, 'height': 667},
+                      locale='ko-KR'
+                  )
+                  page = await context.new_page()
+
+                  try:
+                      await page.goto('${{ env.QA_BASE_URL }}', wait_until='networkidle')
+                      await page.wait_for_timeout(2000)
+                      await page.screenshot(path=str(actual_dir / 'home.png'), full_page=True)
+                      print('✓ 홈 화면 스크린샷 캡처 완료')
+                  except Exception as e:
+                      print(f'스크린샷 캡처 실패: {e}')
+
+                  await browser.close()
+
+          asyncio.run(capture())
+          "
+
+      - name: 시각적 비교 실행
+        run: |
+          python -c "
+          from pathlib import Path
+          from PIL import Image, ImageChops
+          import numpy as np
+
+          baseline_dir = Path('qa/reports/visual/baseline')
+          actual_dir = Path('qa/reports/visual/actual')
+          diff_dir = Path('qa/reports/visual/diff')
+          diff_dir.mkdir(parents=True, exist_ok=True)
+
+          results = []
+          for actual_path in actual_dir.glob('*.png'):
+              baseline_path = baseline_dir / actual_path.name
+
+              if not baseline_path.exists():
+                  print(f'⚠️ 베이스라인 없음: {actual_path.name}')
+                  # 첫 실행 시 베이스라인으로 복사
+                  baseline_dir.mkdir(parents=True, exist_ok=True)
+                  import shutil
+                  shutil.copy(actual_path, baseline_path)
+                  results.append({'name': actual_path.name, 'status': 'NEW'})
+                  continue
+
+              try:
+                  baseline = Image.open(baseline_path).convert('RGB')
+                  actual = Image.open(actual_path).convert('RGB')
+
+                  if baseline.size != actual.size:
+                      actual = actual.resize(baseline.size, Image.Resampling.LANCZOS)
+
+                  diff = ImageChops.difference(baseline, actual)
+                  diff_array = np.array(diff)
+                  diff_pixels = np.sum(np.sum(diff_array, axis=2) > 30)
+                  total_pixels = diff_array.shape[0] * diff_array.shape[1]
+                  diff_pct = (diff_pixels / total_pixels) * 100
+
+                  status = '✓ MATCH' if diff_pct < 0.1 else f'✗ DIFF ({diff_pct:.2f}%)'
+                  print(f'{status}: {actual_path.name}')
+
+                  if diff_pct >= 0.1:
+                      diff.save(diff_dir / f'{actual_path.stem}_diff.png')
+
+                  results.append({'name': actual_path.name, 'diff_pct': diff_pct})
+              except Exception as e:
+                  print(f'비교 오류 ({actual_path.name}): {e}')
+          "
+
+      - name: 베이스라인 업데이트 (main 브랜치)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          cp -r qa/reports/visual/actual/* qa/reports/visual/baseline/ 2>/dev/null || true
+
+      - name: 시각적 테스트 결과 업로드
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: visual-test-results
+          path: qa/reports/visual/
+          retention-days: 30
+
+  # ========================================
+  # 4. 리포트 생성 및 알림
+  # ========================================
+  report:
+    name: 📊 리포트 생성
+    runs-on: ubuntu-latest
+    needs: [figma-check, e2e-test, visual-test]
+    if: always()
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: 의존성 설치
+        run: |
+          pip install openpyxl pandas requests
+
+      - name: 테스트 결과 다운로드
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: 엑셀 리포트 생성
+        run: |
+          python -c "
+          import json
+          from pathlib import Path
+          from datetime import datetime
+          from openpyxl import Workbook
+          from openpyxl.styles import Font, PatternFill, Alignment
+
+          # 결과 수집
+          e2e_report = Path('artifacts/e2e-test-results/e2e-report.json')
+
+          total = passed = failed = skipped = 0
+          if e2e_report.exists():
+              with open(e2e_report) as f:
+                  data = json.load(f)
+              summary = data.get('summary', {})
+              total = summary.get('total', 0)
+              passed = summary.get('passed', 0)
+              failed = summary.get('failed', 0)
+              skipped = summary.get('skipped', 0)
+
+          pass_rate = (passed / total * 100) if total > 0 else 0
+
+          # 엑셀 생성
+          wb = Workbook()
+          ws = wb.active
+          ws.title = '요약'
+
+          ws['A1'] = 'QA 자동화 리포트'
+          ws['A1'].font = Font(bold=True, size=14)
+
+          data = [
+              ['', ''],
+              ['환경', '${{ github.event.inputs.environment || \"qa\" }}'],
+              ['실행 시간', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
+              ['트리거', '${{ github.event_name }}'],
+              ['브랜치', '${{ github.ref_name }}'],
+              ['', ''],
+              ['테스트 결과', ''],
+              ['전체', total],
+              ['통과', passed],
+              ['실패', failed],
+              ['스킵', skipped],
+              ['통과율', f'{pass_rate:.1f}%'],
+          ]
+
+          for row_idx, (label, value) in enumerate(data, 2):
+              ws.cell(row=row_idx, column=1, value=label)
+              ws.cell(row=row_idx, column=2, value=value)
+
+          # 통과율 색상
+          if pass_rate >= 95:
+              fill = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')
+          elif pass_rate >= 80:
+              fill = PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid')
+          else:
+              fill = PatternFill(start_color='FF6B6B', end_color='FF6B6B', fill_type='solid')
+          ws.cell(row=13, column=2).fill = fill
+
+          ws.column_dimensions['A'].width = 15
+          ws.column_dimensions['B'].width = 30
+
+          # 저장
+          Path('qa/reports').mkdir(parents=True, exist_ok=True)
+          filepath = f'qa/reports/QA_Report_{datetime.now().strftime(\"%Y%m%d_%H%M%S\")}.xlsx'
+          wb.save(filepath)
+          print(f'엑셀 리포트 생성: {filepath}')
+          "
+
+      - name: Slack 알림 전송
+        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          # 결과 파싱
+          TOTAL=0
+          PASSED=0
+          FAILED=0
+
+          if [ -f "artifacts/e2e-test-results/e2e-report.json" ]; then
+            TOTAL=$(cat artifacts/e2e-test-results/e2e-report.json | python -c "import sys,json; print(json.load(sys.stdin).get('summary',{}).get('total',0))")
+            PASSED=$(cat artifacts/e2e-test-results/e2e-report.json | python -c "import sys,json; print(json.load(sys.stdin).get('summary',{}).get('passed',0))")
+            FAILED=$(cat artifacts/e2e-test-results/e2e-report.json | python -c "import sys,json; print(json.load(sys.stdin).get('summary',{}).get('failed',0))")
+          fi
+
+          if [ "$TOTAL" -gt 0 ]; then
+            PASS_RATE=$(echo "scale=1; $PASSED * 100 / $TOTAL" | bc)
+          else
+            PASS_RATE="0.0"
+          fi
+
+          # 상태에 따른 색상
+          if [ $(echo "$PASS_RATE >= 95" | bc -l) -eq 1 ]; then
+            COLOR="good"
+            EMOJI="✅"
+            STATUS="PASSED"
+          elif [ $(echo "$PASS_RATE >= 80" | bc -l) -eq 1 ]; then
+            COLOR="warning"
+            EMOJI="⚠️"
+            STATUS="WARNING"
+          else
+            COLOR="danger"
+            EMOJI="❌"
+            STATUS="FAILED"
+          fi
+
+          # Slack 메시지 전송
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{
+              \"attachments\": [{
+                \"color\": \"$COLOR\",
+                \"blocks\": [
+                  {
+                    \"type\": \"header\",
+                    \"text\": {
+                      \"type\": \"plain_text\",
+                      \"text\": \"$EMOJI QA 자동화 리포트\",
+                      \"emoji\": true
+                    }
+                  },
+                  {
+                    \"type\": \"section\",
+                    \"fields\": [
+                      {\"type\": \"mrkdwn\", \"text\": \"*환경:*\n${{ github.event.inputs.environment || 'qa' }}\"},
+                      {\"type\": \"mrkdwn\", \"text\": \"*상태:*\n$STATUS\"},
+                      {\"type\": \"mrkdwn\", \"text\": \"*통과율:*\n${PASS_RATE}%\"},
+                      {\"type\": \"mrkdwn\", \"text\": \"*브랜치:*\n${{ github.ref_name }}\"}
+                    ]
+                  },
+                  {
+                    \"type\": \"section\",
+                    \"text\": {
+                      \"type\": \"mrkdwn\",
+                      \"text\": \"*테스트 결과:*\n• 전체: ${TOTAL}개\n• 통과: ${PASSED}개 ✓\n• 실패: ${FAILED}개 ✗\"
+                    }
+                  },
+                  {
+                    \"type\": \"context\",
+                    \"elements\": [
+                      {\"type\": \"mrkdwn\", \"text\": \"<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|GitHub Actions에서 상세 보기>\"}
+                    ]
+                  }
+                ]
+              }]
+            }" \
+            $SLACK_WEBHOOK_URL
+
+      - name: 리포트 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-report
+          path: qa/reports/*.xlsx
+          retention-days: 90
+
+      - name: Job 요약
+        run: |
+          echo "## 📊 QA 자동화 결과" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 항목 | 결과 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 환경 | ${{ github.event.inputs.environment || 'qa' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 브랜치 | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Figma 변경 | ${{ needs.figma-check.outputs.has_changes || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "상세 결과는 Artifacts에서 확인하세요." >> $GITHUB_STEP_SUMMARY

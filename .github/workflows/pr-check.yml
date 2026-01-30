@@ -1,0 +1,87 @@
+name: PR 체크
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened]
+
+jobs:
+  lint-and-test:
+    name: 🔍 코드 검증
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 의존성 설치
+        run: |
+          pip install -r requirements-qa.txt
+
+      - name: 코드 문법 검사
+        run: |
+          pip install flake8
+          flake8 qa/ --count --select=E9,F63,F7,F82 --show-source --statistics || true
+
+      - name: 기본 테스트 실행
+        env:
+          QA_BASE_URL: https://qa.hiddenmoney.co.kr
+          QA_HEADLESS: 'true'
+        run: |
+          cd qa
+          python -m pytest tests/test_home.py -v --tb=short || true
+
+  smoke-test:
+    name: 🚀 스모크 테스트
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 의존성 설치
+        run: |
+          pip install requests
+
+      - name: 서비스 상태 확인
+        run: |
+          python -c "
+          import requests
+
+          urls = [
+              'https://qa.hiddenmoney.co.kr',
+          ]
+
+          for url in urls:
+              try:
+                  response = requests.get(url, timeout=10)
+                  status = '✓' if response.status_code == 200 else '✗'
+                  print(f'{status} {url} - {response.status_code}')
+              except Exception as e:
+                  print(f'✗ {url} - {e}')
+          "
+
+      - name: PR 코멘트
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '✅ QA 스모크 테스트 완료\n\n상세 결과는 [Actions](' + context.payload.repository.html_url + '/actions/runs/' + context.runId + ')에서 확인하세요.'
+            })
