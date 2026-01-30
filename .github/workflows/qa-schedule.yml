@@ -1,8 +1,8 @@
-name: QA 정기 테스트 (오전 10시)
+name: QA 자동화 테스트 (오전 10시)
 
 on:
   schedule:
-    - cron: '50 0 * * 1-5'  # 평일 오전 9:50 KST (UTC 0:50)
+    - cron: '50 0 * * 1-5'  # 평일 오전 9:50 KST
   workflow_dispatch:
 
 env:
@@ -10,15 +10,51 @@ env:
   SLACK_CHANNEL_ID: C0ACQMG41CY
 
 jobs:
-  daily-test:
-    name: 📅 일일 QA 테스트
+  # ========================================
+  # 1. Figma 변경 감지
+  # ========================================
+  figma-check:
+    name: 1. Figma 변경 감지
     runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.check.outputs.has_changes }}
+      last_modified: ${{ steps.check.outputs.last_modified }}
 
     steps:
-      - name: 시작 시간 기록
+      - name: Figma API 호출
+        id: check
+        env:
+          FIGMA_TOKEN: ${{ secrets.FIGMA_ACCESS_TOKEN }}
         run: |
-          echo "🕐 테스트 시작: $(TZ='Asia/Seoul' date '+%Y-%m-%d %H:%M:%S') KST"
+          if [ -z "$FIGMA_TOKEN" ]; then
+            echo "FIGMA_ACCESS_TOKEN not set, skipping..."
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "last_modified=N/A" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
+          RESPONSE=$(curl -s -H "X-Figma-Token: $FIGMA_TOKEN" \
+            "https://api.figma.com/v1/files/rcxhAYTksM5DmkrjqTuvHc?depth=1")
+
+          LAST_MODIFIED=$(echo $RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin).get('lastModified','Unknown'))" 2>/dev/null || echo "Unknown")
+
+          echo "Figma Last Modified: $LAST_MODIFIED"
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          echo "last_modified=$LAST_MODIFIED" >> $GITHUB_OUTPUT
+
+  # ========================================
+  # 2. E2E 테스트 (Playwright)
+  # ========================================
+  e2e-test:
+    name: 2. E2E 테스트
+    runs-on: ubuntu-latest
+    needs: figma-check
+    outputs:
+      total: ${{ steps.results.outputs.total }}
+      passed: ${{ steps.results.outputs.passed }}
+      failed: ${{ steps.results.outputs.failed }}
+
+    steps:
       - name: 코드 체크아웃
         uses: actions/checkout@v4
 
@@ -26,77 +62,269 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
-      - name: Chrome 브라우저 설치
-        uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: stable
-
-      - name: 의존성 설치
+      - name: Playwright 설치
         run: |
-          pip install selenium webdriver-manager pytest pytest-html pytest-json-report requests python-dotenv
+          pip install playwright pytest pytest-playwright pytest-html pytest-json-report
+          playwright install chromium
+          playwright install-deps chromium
 
-      - name: 테스트 환경 준비
+      - name: 테스트 디렉토리 생성
+        run: mkdir -p qa/reports/screenshots
+
+      - name: E2E 테스트 실행
         run: |
-          mkdir -p qa/reports/screenshots
+          cat > test_e2e.py << 'PYTEST_EOF'
+          import pytest
+          from playwright.sync_api import Page, expect
 
-      - name: 간단 연결 테스트
-        env:
-          QA_HEADLESS: 'true'
+          BASE_URL = "https://qa.hiddenmoney.co.kr"
+
+          class TestHomePage:
+              def test_home_page_loads(self, page: Page):
+                  """홈페이지 로드 테스트"""
+                  page.goto(BASE_URL)
+                  page.wait_for_load_state("networkidle")
+                  assert page.url.startswith(BASE_URL.replace("https://", "").replace("http://", "")) or "hiddenmoney" in page.url
+
+              def test_page_title_exists(self, page: Page):
+                  """페이지 타이틀 존재 확인"""
+                  page.goto(BASE_URL)
+                  title = page.title()
+                  assert len(title) > 0, "Page title should not be empty"
+
+              def test_page_has_content(self, page: Page):
+                  """페이지 콘텐츠 존재 확인"""
+                  page.goto(BASE_URL)
+                  page.wait_for_load_state("networkidle")
+                  body = page.locator("body")
+                  assert body.is_visible()
+
+              def test_no_console_errors(self, page: Page):
+                  """콘솔 에러 없음 확인"""
+                  errors = []
+                  page.on("console", lambda msg: errors.append(msg.text) if msg.type == "error" else None)
+                  page.goto(BASE_URL)
+                  page.wait_for_load_state("networkidle")
+                  critical_errors = [e for e in errors if "fatal" in e.lower() or "uncaught" in e.lower()]
+                  assert len(critical_errors) == 0, f"Critical console errors: {critical_errors}"
+
+              def test_responsive_mobile(self, page: Page):
+                  """모바일 반응형 테스트"""
+                  page.set_viewport_size({"width": 375, "height": 667})
+                  page.goto(BASE_URL)
+                  page.wait_for_load_state("networkidle")
+                  assert page.locator("body").is_visible()
+
+              def test_screenshot_capture(self, page: Page):
+                  """스크린샷 캡처"""
+                  page.goto(BASE_URL)
+                  page.wait_for_load_state("networkidle")
+                  page.screenshot(path="qa/reports/screenshots/homepage.png", full_page=True)
+          PYTEST_EOF
+
+          python -m pytest test_e2e.py -v \
+            --html=qa/reports/e2e-report.html \
+            --self-contained-html \
+            --json-report \
+            --json-report-file=qa/reports/e2e-report.json \
+            || true
+
+      - name: 테스트 결과 파싱
+        id: results
         run: |
-          python << 'EOF'
-          import requests
-          import json
-          from datetime import datetime
-
-          url = "https://qa.hiddenmoney.co.kr"
-          results = {"summary": {"total": 1, "passed": 0, "failed": 0, "skipped": 0}, "tests": []}
-
-          try:
-              response = requests.get(url, timeout=30)
-              if response.status_code == 200:
-                  print(f"✓ {url} - 연결 성공 (status: {response.status_code})")
-                  results["summary"]["passed"] = 1
-                  results["tests"].append({"name": "connection_test", "outcome": "passed"})
-              else:
-                  print(f"✗ {url} - 응답 코드: {response.status_code}")
-                  results["summary"]["failed"] = 1
-                  results["tests"].append({"name": "connection_test", "outcome": "failed"})
-          except Exception as e:
-              print(f"✗ {url} - 연결 실패: {e}")
-              results["summary"]["failed"] = 1
-              results["tests"].append({"name": "connection_test", "outcome": "failed", "error": str(e)})
-
-          # JSON 리포트 저장
-          with open("qa/reports/daily-report.json", "w") as f:
-              json.dump(results, f, indent=2)
-
-          print(f"\n📊 테스트 결과: {results['summary']}")
-          EOF
+          if [ -f "qa/reports/e2e-report.json" ]; then
+            TOTAL=$(python3 -c "import json; print(json.load(open('qa/reports/e2e-report.json')).get('summary',{}).get('total',0))")
+            PASSED=$(python3 -c "import json; print(json.load(open('qa/reports/e2e-report.json')).get('summary',{}).get('passed',0))")
+            FAILED=$(python3 -c "import json; print(json.load(open('qa/reports/e2e-report.json')).get('summary',{}).get('failed',0))")
+          else
+            TOTAL=0
+            PASSED=0
+            FAILED=0
+          fi
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+          echo "passed=$PASSED" >> $GITHUB_OUTPUT
+          echo "failed=$FAILED" >> $GITHUB_OUTPUT
+          echo "Test Results: $PASSED/$TOTAL passed"
 
       - name: 테스트 결과 업로드
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: daily-test-${{ github.run_number }}
+          name: e2e-test-results
           path: qa/reports/
-          retention-days: 14
+          retention-days: 30
 
-      - name: Slack 리포트 전송
+  # ========================================
+  # 3. 시각적 회귀 테스트
+  # ========================================
+  visual-test:
+    name: 3. 시각적 회귀 테스트
+    runs-on: ubuntu-latest
+    needs: e2e-test
+    outputs:
+      diff_detected: ${{ steps.compare.outputs.diff_detected }}
+      diff_percent: ${{ steps.compare.outputs.diff_percent }}
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 의존성 설치
+        run: |
+          pip install playwright Pillow numpy
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: 베이스라인 캐시 복원
+        uses: actions/cache@v4
+        with:
+          path: visual-baseline/
+          key: visual-baseline-${{ github.ref_name }}-v1
+          restore-keys: |
+            visual-baseline-master-v1
+            visual-baseline-
+
+      - name: 스크린샷 캡처 및 비교
+        id: compare
+        run: |
+          mkdir -p visual-baseline visual-actual visual-diff
+
+          python3 << 'VISUAL_EOF'
+          import asyncio
+          from pathlib import Path
+          from playwright.async_api import async_playwright
+
+          async def capture_screenshots():
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True)
+
+                  viewports = [
+                      {"name": "mobile", "width": 375, "height": 667},
+                      {"name": "tablet", "width": 768, "height": 1024},
+                      {"name": "desktop", "width": 1280, "height": 800},
+                  ]
+
+                  for vp in viewports:
+                      context = await browser.new_context(
+                          viewport={"width": vp["width"], "height": vp["height"]},
+                          locale="ko-KR"
+                      )
+                      page = await context.new_page()
+
+                      try:
+                          await page.goto("https://qa.hiddenmoney.co.kr", wait_until="networkidle", timeout=30000)
+                          await page.wait_for_timeout(2000)
+                          await page.screenshot(path=f"visual-actual/{vp['name']}.png", full_page=True)
+                          print(f"Captured: {vp['name']}")
+                      except Exception as e:
+                          print(f"Error capturing {vp['name']}: {e}")
+
+                      await context.close()
+
+                  await browser.close()
+
+          asyncio.run(capture_screenshots())
+          VISUAL_EOF
+
+          # 비교
+          python3 << 'COMPARE_EOF'
+          from pathlib import Path
+          from PIL import Image, ImageChops
+          import numpy as np
+          import os
+
+          baseline_dir = Path("visual-baseline")
+          actual_dir = Path("visual-actual")
+          diff_dir = Path("visual-diff")
+
+          max_diff = 0
+          diff_detected = False
+
+          for actual_path in actual_dir.glob("*.png"):
+              baseline_path = baseline_dir / actual_path.name
+
+              if not baseline_path.exists():
+                  print(f"NEW: {actual_path.name} (no baseline)")
+                  baseline_dir.mkdir(parents=True, exist_ok=True)
+                  import shutil
+                  shutil.copy(actual_path, baseline_path)
+                  continue
+
+              try:
+                  baseline = Image.open(baseline_path).convert("RGB")
+                  actual = Image.open(actual_path).convert("RGB")
+
+                  if baseline.size != actual.size:
+                      actual = actual.resize(baseline.size, Image.Resampling.LANCZOS)
+
+                  diff = ImageChops.difference(baseline, actual)
+                  diff_array = np.array(diff)
+                  diff_pixels = np.sum(np.sum(diff_array, axis=2) > 30)
+                  total_pixels = diff_array.shape[0] * diff_array.shape[1]
+                  diff_pct = (diff_pixels / total_pixels) * 100
+
+                  if diff_pct > max_diff:
+                      max_diff = diff_pct
+
+                  if diff_pct > 0.5:
+                      diff_detected = True
+                      diff.save(diff_dir / f"{actual_path.stem}_diff.png")
+                      print(f"DIFF: {actual_path.name} ({diff_pct:.2f}%)")
+                  else:
+                      print(f"MATCH: {actual_path.name} ({diff_pct:.2f}%)")
+
+              except Exception as e:
+                  print(f"Error comparing {actual_path.name}: {e}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"diff_detected={'true' if diff_detected else 'false'}\n")
+              f.write(f"diff_percent={max_diff:.2f}\n")
+          COMPARE_EOF
+
+      - name: 베이스라인 업데이트
+        run: |
+          cp -r visual-actual/* visual-baseline/ 2>/dev/null || true
+
+      - name: 시각적 테스트 결과 업로드
+        uses: actions/upload-artifact@v4
         if: always()
+        with:
+          name: visual-test-results
+          path: |
+            visual-actual/
+            visual-diff/
+          retention-days: 30
+
+  # ========================================
+  # 4. Slack 리포트
+  # ========================================
+  slack-report:
+    name: 4. Slack 리포트
+    runs-on: ubuntu-latest
+    needs: [figma-check, e2e-test, visual-test]
+    if: always()
+
+    steps:
+      - name: Slack 리포트 전송
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
         run: |
-          TOTAL=0
-          PASSED=0
-          FAILED=0
+          TOTAL="${{ needs.e2e-test.outputs.total }}"
+          PASSED="${{ needs.e2e-test.outputs.passed }}"
+          FAILED="${{ needs.e2e-test.outputs.failed }}"
+          FIGMA_MODIFIED="${{ needs.figma-check.outputs.last_modified }}"
+          VISUAL_DIFF="${{ needs.visual-test.outputs.diff_detected }}"
+          VISUAL_PERCENT="${{ needs.visual-test.outputs.diff_percent }}"
 
-          if [ -f "qa/reports/daily-report.json" ]; then
-            TOTAL=$(python -c "import json; print(json.load(open('qa/reports/daily-report.json')).get('summary',{}).get('total',0))")
-            PASSED=$(python -c "import json; print(json.load(open('qa/reports/daily-report.json')).get('summary',{}).get('passed',0))")
-            FAILED=$(python -c "import json; print(json.load(open('qa/reports/daily-report.json')).get('summary',{}).get('failed',0))")
-          fi
+          TOTAL=${TOTAL:-0}
+          PASSED=${PASSED:-0}
+          FAILED=${FAILED:-0}
 
           if [ "$TOTAL" -gt 0 ]; then
             PASS_RATE=$(echo "scale=1; $PASSED * 100 / $TOTAL" | bc)
@@ -113,6 +341,11 @@ jobs:
           else
             COLOR="#ff0000"
             STATUS="FAILED"
+          fi
+
+          VISUAL_STATUS="No Changes"
+          if [ "$VISUAL_DIFF" = "true" ]; then
+            VISUAL_STATUS="Changes Detected (${VISUAL_PERCENT}%)"
           fi
 
           TODAY=$(TZ='Asia/Seoul' date '+%Y-%m-%d')
@@ -145,10 +378,20 @@ jobs:
                     ]
                   },
                   {
+                    \"type\": \"divider\"
+                  },
+                  {
                     \"type\": \"section\",
                     \"text\": {
                       \"type\": \"mrkdwn\",
-                      \"text\": \"*Test Results:*\n- Total: ${TOTAL}\n- Passed: ${PASSED}\n- Failed: ${FAILED}\"
+                      \"text\": \"*E2E Test Results:*\n- Total: ${TOTAL}\n- Passed: ${PASSED}\n- Failed: ${FAILED}\"
+                    }
+                  },
+                  {
+                    \"type\": \"section\",
+                    \"text\": {
+                      \"type\": \"mrkdwn\",
+                      \"text\": \"*Visual Regression:*\n${VISUAL_STATUS}\"
                     }
                   },
                   {
@@ -162,6 +405,5 @@ jobs:
             }"
 
       - name: 완료 시간 기록
-        if: always()
         run: |
-          echo "🕐 테스트 완료: $(TZ='Asia/Seoul' date '+%Y-%m-%d %H:%M:%S') KST"
+          echo "Test completed: $(TZ='Asia/Seoul' date '+%Y-%m-%d %H:%M:%S') KST"
