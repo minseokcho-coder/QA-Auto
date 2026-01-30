@@ -1,7 +1,7 @@
 name: QA 자동화 파이프라인
 
 on:
-  # 수동 실행
+  # 수동 실행만 가능 (자동 트리거 비활성화)
   workflow_dispatch:
     inputs:
       environment:
@@ -13,39 +13,6 @@ on:
           - qa
           - staging
           - prod
-      skip_figma:
-        description: 'Figma 체크 스킵'
-        required: false
-        default: false
-        type: boolean
-      skip_visual:
-        description: '시각적 테스트 스킵'
-        required: false
-        default: false
-        type: boolean
-      generate_tc:
-        description: 'TC 자동 생성'
-        required: false
-        default: false
-        type: boolean
-
-  # 스케줄 (매일 오전 9시 KST = UTC 0시)
-  schedule:
-    - cron: '0 0 * * *'
-
-  # PR 시 자동 실행
-  pull_request:
-    branches: [main, develop]
-    paths:
-      - 'src/**'
-      - 'qa/**'
-      - '.github/workflows/qa-automation.yml'
-
-  # main 브랜치 push 시
-  push:
-    branches: [main]
-    paths:
-      - 'src/**'
 
 env:
   PYTHON_VERSION: '3.11'
@@ -58,7 +25,7 @@ jobs:
   figma-check:
     name: 📐 Figma 변경 감지
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.skip_figma != 'true' }}
+    if: always()
     outputs:
       has_changes: ${{ steps.check.outputs.has_changes }}
       new_screens: ${{ steps.check.outputs.new_screens }}
@@ -228,7 +195,7 @@ jobs:
     name: 👁️ 시각적 회귀 테스트
     runs-on: ubuntu-latest
     needs: [e2e-test]
-    if: ${{ github.event.inputs.skip_visual != 'true' && always() }}
+    if: always()
 
     steps:
       - name: 코드 체크아웃
