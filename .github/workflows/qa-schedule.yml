@@ -317,6 +317,9 @@ jobs:
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
         run: |
+          echo "=== Slack Report Debug ==="
+          echo "SLACK_BOT_TOKEN set: $([ -n \"$SLACK_BOT_TOKEN\" ] && echo 'YES' || echo 'NO')"
+
           TOTAL="${{ needs.e2e-test.outputs.total }}"
           PASSED="${{ needs.e2e-test.outputs.passed }}"
           FAILED="${{ needs.e2e-test.outputs.failed }}"
@@ -353,7 +356,12 @@ jobs:
           TODAY=$(TZ='Asia/Seoul' date '+%Y-%m-%d')
           NOW=$(TZ='Asia/Seoul' date '+%H:%M')
 
-          curl -X POST https://slack.com/api/chat.postMessage \
+          echo "=== Sending to Slack ==="
+          echo "Channel: ${{ env.SLACK_CHANNEL_ID }}"
+          echo "Total: $TOTAL, Passed: $PASSED, Failed: $FAILED"
+          echo "Pass Rate: $PASS_RATE%, Status: $STATUS"
+
+          RESPONSE=$(curl -s -X POST https://slack.com/api/chat.postMessage \
             -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
             -H "Content-Type: application/json" \
             --data "{
@@ -404,7 +412,10 @@ jobs:
                   }
                 ]
               }]
-            }"
+            }")
+
+          echo "=== Slack API Response ==="
+          echo "$RESPONSE"
 
       - name: 완료 시간 기록
         run: |
