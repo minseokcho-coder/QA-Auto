@@ -2,7 +2,9 @@ name: QA 자동화 테스트 (오전 10시)
 
 on:
   schedule:
-    - cron: '50 0 * * 1-5'  # 평일 오전 9:50 KST
+    # 10시 정각 리포팅을 위해 9:45 KST 시작 (약 15분 소요)
+    # 9:45 KST = 0:45 UTC
+    - cron: '45 0 * * 1-5'  # 평일 오전 9:45 KST
   workflow_dispatch:
 
 env:
