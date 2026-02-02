@@ -420,3 +420,4 @@ jobs:
       - name: 완료 시간 기록
         run: |
           echo "Test completed: $(TZ='Asia/Seoul' date '+%Y-%m-%d %H:%M:%S') KST"
+# Scheduler wake-up: 2026년 02월  2일 월 오전 10:57:01
