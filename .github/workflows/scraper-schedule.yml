@@ -1,0 +1,46 @@
+name: PM/PO 아티클 스크래핑 (매일 11시)
+
+on:
+  schedule:
+    # 매일 오전 11시 KST (= 02:00 UTC)
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  scrape-and-notify:
+    name: 스크래핑 → Slack 전송
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 의존성 설치
+        run: pip install -r requirements.txt
+
+      - name: 캐시 복원
+        uses: actions/cache@v4
+        with:
+          path: cache.json
+          key: scraper-cache-${{ github.run_number }}
+          restore-keys: |
+            scraper-cache-
+
+      - name: 스크래핑 실행
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: C0AB756M291
+        run: python main.py --run
+
+      - name: 캐시 커밋 (중복 방지)
+        run: |
+          git config user.email "minseokcho-coder@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add cache.json || true
+          git diff --cached --quiet || git commit -m "chore: update scraper cache [skip ci]"
+          git push || true
