@@ -39,15 +39,17 @@ def _change_emoji(before: float, after: float) -> str:
     return "→ 동일"
 
 
-def _change_pct(before: float, after: float) -> str:
+def _change_pct(before: float, after: float, invert: bool = False) -> str:
     if before == 0:
         return "N/A"
     pct = ((after - before) / before) * 100
+    up = ":arrow_down:" if invert else ":arrow_up:"
+    down = ":arrow_up:" if invert else ":arrow_down:"
     if pct > 0:
-        return f":arrow_up: +{pct:.1f}%"
+        return f"{up} +{pct:.1f}%"
     if pct < 0:
-        return f":arrow_down: {pct:.1f}%"
-    return "→ 동일"
+        return f"{down} {pct:.1f}%"
+    return "-> 동일"
 
 
 def _build_campaign_blocks(prev: dict, curr: dict, prev_label: str, curr_label: str,
@@ -190,7 +192,7 @@ def _build_campaign_blocks(prev: dict, curr: dict, prev_label: str, curr_label: 
                 continue
             text = f"*{name}*\n{curr[key]:,.0f}원"
             if prev.get(key):
-                text += f" {_change_pct(prev[key], curr[key])}"
+                text += f" {_change_pct(prev[key], curr[key], invert=True)}"
             cac_fields.append({"type": "mrkdwn", "text": text})
         if cac_fields:
             blocks.append({"type": "section", "fields": cac_fields})
@@ -240,6 +242,102 @@ def _build_insights(prev: dict, curr: dict, prev_label: str, curr_label: str) ->
             lines.append(f":chart_with_upwards_trend: *EPA 성장*: +{_fmt_won(diff)}")
         elif diff < 0:
             lines.append(f":chart_with_downwards_trend: *EPA 감소*: {_fmt_won(abs(diff))}")
+
+    return "\n".join(lines)
+
+
+def _build_analysis_summary(sheet_data: dict) -> str:
+    """전체 캠페인 종합 분석 요약"""
+    points = []
+    actions = []
+
+    for camp_key, camp_name in [("jongso", "종소세"), ("jaesan", "재산세")]:
+        months = sheet_data.get(camp_key, {})
+        keys = list(months.keys())
+        if len(keys) < 2:
+            continue
+
+        prev, curr = months[keys[-2]], months[keys[-1]]
+        prev_label = prev.get("label", keys[-2])
+        curr_label = curr.get("label", keys[-1])
+        is_partial = curr.get("day_count", 0) > 0 and curr.get("day_count", 31) < 20
+
+        # 비용 효율 분석
+        prev_cost = prev.get("total_cost", 0)
+        curr_cost = curr.get("total_cost", 0)
+        prev_roas = prev.get("roas", 0)
+        curr_roas = curr.get("roas", 0)
+        if prev_cost and curr_cost and prev_roas and curr_roas:
+            cost_pct = ((curr_cost - prev_cost) / prev_cost) * 100
+            roas_diff = curr_roas - prev_roas
+            if cost_pct > 10 and roas_diff < 0:
+                points.append(f"*{camp_name}*: 비용 {cost_pct:+.0f}% 증가 대비 ROAS {roas_diff:.1f}%p 하락 - 비용 효율 점검 필요")
+                actions.append(f"{camp_name} 타겟팅/소재 최적화 검토")
+            elif cost_pct < -5 and roas_diff > 0:
+                points.append(f"*{camp_name}*: 비용 절감(-{abs(cost_pct):.0f}%)하면서 ROAS 개선(+{roas_diff:.1f}%p) - 효율 우수")
+
+        # 전환 퍼널 분석
+        view_r = curr.get("view_rate", 0)
+        signup_r = curr.get("signup_rate", 0)
+        auth_r = curr.get("auth_rate", 0)
+        prev_view = prev.get("view_rate", 0)
+        prev_signup = prev.get("signup_rate", 0)
+        prev_auth = prev.get("auth_rate", 0)
+
+        if view_r > 0 and signup_r > 0:
+            # 열람은 높은데 가입이 낮으면
+            if view_r > prev_view and signup_r < prev_signup:
+                points.append(f"*{camp_name}*: 열람율 상승({view_r:.1f}%) 대비 가입율 하락({signup_r:.2f}%) - 랜딩 페이지 전환 병목")
+                actions.append(f"{camp_name} 랜딩 페이지 CTA/UX 개선 검토")
+            # 가입은 높은데 인증이 낮으면
+            if signup_r > prev_signup and auth_r < prev_auth and auth_r > 0:
+                points.append(f"*{camp_name}*: 가입율 상승 대비 인증율 하락({auth_r:.1f}%) - 인증 단계 이탈 분석 필요")
+                actions.append(f"{camp_name} 본인인증 UX 개선 또는 리마인드 발송 검토")
+
+        # CAC 분석
+        prev_cac = prev.get("cac_signup", 0)
+        curr_cac = curr.get("cac_signup", 0)
+        if prev_cac and curr_cac:
+            cac_pct = ((curr_cac - prev_cac) / prev_cac) * 100
+            if cac_pct > 20:
+                points.append(f"*{camp_name}*: 가입CAC {prev_cac:,.0f}원 -> {curr_cac:,.0f}원 (+{cac_pct:.0f}%) - 획득 비용 급등")
+                actions.append(f"{camp_name} 모수 확대 또는 단가 협상 필요")
+            elif cac_pct < -10:
+                points.append(f"*{camp_name}*: 가입CAC {curr_cac:,.0f}원으로 {abs(cac_pct):.0f}% 절감 - 효율 개선")
+
+        # 채널별 신청율 분석
+        apply_rate = curr.get("jongso_apply_rate", 0)
+        prev_apply_rate = prev.get("jongso_apply_rate", 0)
+        if apply_rate and prev_apply_rate:
+            diff = apply_rate - prev_apply_rate
+            if diff < -5:
+                points.append(f"*{camp_name}*: 종소세 신청율 {prev_apply_rate:.1f}% -> {apply_rate:.1f}% 하락 - 유효->신청 전환 점검")
+            elif diff > 5:
+                points.append(f"*{camp_name}*: 종소세 신청율 {apply_rate:.1f}%로 개선(+{diff:.1f}%p)")
+
+        # 진행 중 월 페이스 예측
+        if is_partial and curr.get("day_count", 0) > 3:
+            days = curr["day_count"]
+            curr_sends = curr.get("total_sends", 0)
+            prev_sends = prev.get("total_sends", 0)
+            if curr_sends and prev_sends:
+                projected = curr_sends / days * 30
+                pace_pct = (projected / prev_sends) * 100
+                if pace_pct < 80:
+                    points.append(f"*{camp_name}*: {days}일 기준 월말 예상 발송 {projected:,.0f}건 (전월 대비 {pace_pct:.0f}% 페이스)")
+                    actions.append(f"{camp_name} 발송 모수 확대 계획 수립 필요")
+
+    if not points and not actions:
+        return ""
+
+    lines = ["*:mag: 종합 분석 요약*\n"]
+    for p in points:
+        lines.append(f"- {p}")
+
+    if actions:
+        lines.append("\n*:pushpin: Action Items*")
+        for i, a in enumerate(actions, 1):
+            lines.append(f"{i}. {a}")
 
     return "\n".join(lines)
 
@@ -337,6 +435,15 @@ def build_report_blocks(sheet_data: dict = None) -> list:
         blocks.append({
             "type": "section",
             "text": {"type": "mrkdwn", "text": "\n".join(lines)},
+        })
+
+    # ── 분석 요약 ──
+    summary = _build_analysis_summary(sheet_data)
+    if summary:
+        blocks.append({"type": "divider"})
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": summary},
         })
 
     # ── 푸터 ──
